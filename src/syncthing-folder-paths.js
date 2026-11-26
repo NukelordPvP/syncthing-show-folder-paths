@@ -1,8 +1,9 @@
+
 // ==UserScript==
 // @name         Syncthing - Show Folder Paths
 // @namespace    https://violentmonkey.github.io/
-// @version      2.0.0
-// @description  Show local and NukeTop origin paths for Syncthing folders.
+// @version      1.8
+// @description  Capture local paths and show NukeTop origin paths
 // @match        http://*/*
 // @match        https://*/*
 // @run-at       document-idle
@@ -12,259 +13,640 @@
 
 (() => {
     'use strict';
-    if (location.port !== '8384') return;
+
+    // ----------------------------------------
+    // NukeTop API configuration
+    // ----------------------------------------
 
     const ORIGIN_NAME = 'NukeTop';
+
+    // Replace with NukeTop's LAN or WireGuard address.
     const ORIGIN_URL = __ORIGIN_URL__;
+
+    // Paste NukeTop's Syncthing GUI API key here.
+    // Keep this userscript private.
     const ORIGIN_API_KEY = __ORIGIN_API_KEY__;
-    const LOCAL_KEY = 'syncthing-folder-paths-local-v2';
-    const ORIGIN_KEY = 'syncthing-folder-paths-origin-v2';
-    const DELAY = 800;
-    const WAIT_LIMIT = 7000;
 
-    let localPaths = readCache(LOCAL_KEY);
-    let originPaths = readCache(ORIGIN_KEY);
-    let busy = false;
-    let scheduled = false;
+    const LOCAL_STORAGE_KEY = 'syncthing-captured-folder-paths';
+    const ORIGIN_STORAGE_KEY = 'syncthing-origin-folder-paths';
 
-    function readCache(key) {
+    let savedPaths = {};
+    let originPaths = {};
+
+    try {
+        savedPaths = JSON.parse(
+            localStorage.getItem(LOCAL_STORAGE_KEY) || '{}'
+        );
+    } catch (error) {
+        savedPaths = {};
+    }
+
+    try {
+        originPaths = JSON.parse(
+            localStorage.getItem(ORIGIN_STORAGE_KEY) || '{}'
+        );
+    } catch (error) {
+        originPaths = {};
+    }
+
+    let scanRunning = false;
+    let scanStarted = false;
+    let updateScheduled = false;
+
+    // ----------------------------------------
+    // Storage
+    // ----------------------------------------
+
+    function saveLocalPaths() {
         try {
-            const parsed = JSON.parse(localStorage.getItem(key) || '{}');
-            return parsed && typeof parsed === 'object' ? parsed : {};
-        } catch {
-            return {};
+            localStorage.setItem(
+                LOCAL_STORAGE_KEY,
+                JSON.stringify(savedPaths)
+            );
+        } catch (error) {
+            console.warn(
+                '[Syncthing Paths] Could not save local paths:',
+                error
+            );
         }
     }
 
-    function saveCache(key, value) {
-        try { localStorage.setItem(key, JSON.stringify(value)); }
-        catch (e) { console.warn('[Folder Paths] Cache write failed', e); }
+    function saveOriginPaths() {
+        try {
+            localStorage.setItem(
+                ORIGIN_STORAGE_KEY,
+                JSON.stringify(originPaths)
+            );
+        } catch (error) {
+            console.warn(
+                '[Syncthing Paths] Could not save origin paths:',
+                error
+            );
+        }
     }
 
-    function cards() {
-        return [...document.querySelectorAll('[id^="folder-"]')]
-            .filter(el => el.querySelector('.panel-heading'));
-    }
+    function storeLocalPath(folderId, path) {
+        if (!folderId || !path) {
+            return;
+        }
 
-    function folderId(card) {
-        const el = card.querySelector(
-            '.panel-heading [data-original-title], .panel-title [data-original-title]'
+        if (savedPaths[folderId] === path) {
+            return;
+        }
+
+        savedPaths[folderId] = path;
+        saveLocalPaths();
+
+        console.info(
+            '[Syncthing Paths] Local path captured:',
+            folderId,
+            path
         );
-        return el?.getAttribute('data-original-title')?.trim()
-            || card.getAttribute('data-folder-id')
-            || card.getAttribute('data-id')
-            || '';
     }
 
-    function expanded(card) {
-        const el = card.querySelector('.panel-collapse, [class*="collapse"]');
-        return !!el && (
-            el.classList.contains('in') ||
-            el.classList.contains('show') ||
-            el.getAttribute('aria-expanded') === 'true'
+    // ----------------------------------------
+    // Styling
+    // ----------------------------------------
+
+    const style = document.createElement('style');
+
+    style.textContent = `
+        #folders .panel-heading,
+        [id^="folders-"] .panel-heading {
+            height: auto !important;
+            min-height: 40px;
+            white-space: normal !important;
+            overflow: visible !important;
+        }
+
+        #folders .panel-title-text,
+        [id^="folders-"] .panel-title-text {
+            display: block !important;
+            height: auto !important;
+            max-height: none !important;
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: unset !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+            line-height: 1.5 !important;
+        }
+
+        .syncthing-captured-path {
+            display: block !important;
+            margin-left: 8px;
+            font-weight: normal;
+            opacity: 0.85;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+        }
+    `;
+
+    document.head.appendChild(style);
+
+    // ----------------------------------------
+    // Folder identification
+    // ----------------------------------------
+
+    function getFolderId(panel) {
+        const tooltip = panel.querySelector(
+            '.panel-heading [data-original-title]'
         );
+
+        if (!tooltip) {
+            return null;
+        }
+
+        const id = tooltip.getAttribute('data-original-title');
+
+        return id && id.trim() ? id.trim() : null;
     }
 
-    function toggle(card) {
-        const heading = card.querySelector('.panel-heading');
-        if (!heading) return false;
-        const control = heading.querySelector(
-            '[data-toggle="collapse"], [data-bs-toggle="collapse"], button, a'
+    function getFolderPath(panel) {
+        const rows = panel.querySelectorAll(
+            '.panel-body tr, .panel-collapse tr'
         );
-        (control || heading).click();
-        return true;
-    }
 
-    function readPath(card) {
-        for (const row of card.querySelectorAll('tr')) {
-            const cells = [...row.querySelectorAll('th,td')];
-            if (cells.length < 2) continue;
-            const label = cells[0].textContent.trim().replace(/:$/, '').toLowerCase();
-            if (label === 'folder path' || label === 'path') {
-                const path = cells.slice(1).map(x => x.textContent.trim()).filter(Boolean).join(' ');
-                if (path) return path;
+        for (const row of rows) {
+            const heading = row.querySelector('th, td');
+
+            if (!heading) {
+                continue;
+            }
+
+            if (
+                heading.textContent.trim().toLowerCase() !==
+                'folder path'
+            ) {
+                continue;
+            }
+
+            const cells = row.querySelectorAll('td');
+
+            if (cells.length > 0) {
+                const path = cells[cells.length - 1]
+                    .textContent
+                    .trim();
+
+                if (path) {
+                    return path;
+                }
             }
         }
-        for (const label of card.querySelectorAll('dt,label,.control-label')) {
-            const name = label.textContent.trim().replace(/:$/, '').toLowerCase();
-            if (name === 'folder path' || name === 'path') {
-                const value = label.nextElementSibling?.textContent.trim();
-                if (value) return value;
+
+        return null;
+    }
+
+    function getFolderPanels() {
+        return document.querySelectorAll(
+            '#folders .panel, [id^="folders-"] .panel'
+        );
+    }
+
+    // ----------------------------------------
+    // Display local and origin paths
+    // ----------------------------------------
+
+    function showPaths(panel, folderId) {
+        const localPath = savedPaths[folderId];
+        const originPath = originPaths[folderId];
+
+        if (!localPath && !originPath) {
+            return;
+        }
+
+        const heading = panel.querySelector('.panel-title-text');
+
+        if (!heading) {
+            return;
+        }
+
+        let pathElement = heading.querySelector(
+            '.syncthing-captured-path'
+        );
+
+        if (!pathElement) {
+            pathElement = document.createElement('span');
+            pathElement.className = 'syncthing-captured-path';
+            heading.appendChild(pathElement);
+        }
+
+        const parts = [];
+
+        if (localPath) {
+            parts.push('Local: ' + localPath);
+        }
+
+        if (originPath) {
+            parts.push(
+                'Origin (' + ORIGIN_NAME + '): ' + originPath
+            );
+        }
+
+        const displayText = parts.join(' | ');
+
+        if (pathElement.textContent !== displayText) {
+            pathElement.textContent = displayText;
+        }
+
+        pathElement.title = 'Local and origin folder paths';
+    }
+
+    function processFolders() {
+        for (const panel of getFolderPanels()) {
+            const folderId = getFolderId(panel);
+
+            if (!folderId) {
+                continue;
             }
-        }
-        return '';
-    }
 
-    function waitPath(card) {
-        return new Promise(resolve => {
-            const start = Date.now();
-            const poll = () => {
-                const path = readPath(card);
-                if (path || Date.now() - start >= WAIT_LIMIT) return resolve(path);
-                setTimeout(poll, 200);
-            };
-            poll();
-        });
-    }
+            const path = getFolderPath(panel);
 
-    function displayFor(card) {
-        const title = card.querySelector('.panel-title');
-        if (!title) return null;
-        let el = title.querySelector('.syncthing-path-display');
-        if (!el) {
-            el = document.createElement('div');
-            el.className = 'syncthing-path-display';
-            title.appendChild(el);
-        }
-        return el;
-    }
+            if (path) {
+                storeLocalPath(folderId, path);
+            }
 
-    function render(card) {
-        const id = folderId(card);
-        if (!id) return;
-        const box = displayFor(card);
-        if (!box) return;
-        box.replaceChildren();
-
-        const origin = originPaths[id];
-        const local = localPaths[id];
-
-        if (origin) {
-            const line = document.createElement('div');
-            line.textContent = `Origin (${ORIGIN_NAME}): ${origin}`;
-            box.appendChild(line);
-        }
-        if (local) {
-            const line = document.createElement('div');
-            line.textContent = `Local: ${local}`;
-            box.appendChild(line);
+            showPaths(panel, folderId);
         }
     }
 
-    function renderAll() { cards().forEach(render); }
+    // ----------------------------------------
+    // NukeTop API lookup
+    // ----------------------------------------
 
-    function layout() {
-        const devices = document.querySelector('#devices');
-        const folders = document.querySelector('#folders');
-        if (!devices || !folders) return;
-
-        devices.closest('[class*="col-"]')?.classList.add('syncthing-paths-full-width');
-        folders.closest('[class*="col-"]')?.classList.add('syncthing-paths-full-width');
-
-        const row = devices.closest('.row');
-        if (row && folders.closest('.row') === row) {
-            row.classList.add('syncthing-paths-dashboard-row');
-        }
-    }
-
-    function styles() {
-        if (document.getElementById('syncthing-folder-paths-style')) return;
-        const style = document.createElement('style');
-        style.id = 'syncthing-folder-paths-style';
-        style.textContent = `
-          .syncthing-paths-dashboard-row{display:flex!important;flex-direction:column!important}
-          .syncthing-paths-full-width{width:100%!important;max-width:100%!important;flex:0 0 100%!important}
-          .syncthing-path-display{display:block;margin-top:5px;font-size:12px;font-weight:normal;line-height:1.45;white-space:normal;overflow-wrap:anywhere;word-break:break-word;opacity:.85}
-          .syncthing-path-display>div{white-space:normal;overflow-wrap:anywhere;word-break:break-word}
-          .panel-title{white-space:normal;overflow-wrap:anywhere}
-        `;
-        document.head.appendChild(style);
-    }
-
-    function fetchOrigin() {
+    function fetchOriginFolders() {
         return new Promise((resolve, reject) => {
+            if (
+                !ORIGIN_API_KEY ||
+                ORIGIN_API_KEY === 'PASTE_NUKETOP_API_KEY_HERE'
+            ) {
+                reject(new Error('NukeTop API key has not been configured.'));
+                return;
+            }
+
+            const url =
+                ORIGIN_URL.replace(/\/+$/, '') +
+                '/rest/config/folders';
+
             GM_xmlhttpRequest({
                 method: 'GET',
-                url: `${ORIGIN_URL.replace(/\/$/, '')}/rest/config/folders`,
-                headers: { 'X-API-Key': ORIGIN_API_KEY },
-                timeout: 12000,
-                onload: response => {
-                    if (response.status < 200 || response.status >= 300) {
-                        return reject(new Error(`NukeTop API HTTP ${response.status}`));
-                    }
-                    try {
-                        const result = {};
-                        for (const folder of JSON.parse(response.responseText)) {
-                            if (folder.id && folder.path) result[folder.id] = folder.path;
-                        }
-                        resolve(result);
-                    } catch (e) { reject(e); }
+                url,
+                headers: {
+                    'X-API-Key': ORIGIN_API_KEY
                 },
-                onerror: () => reject(new Error('NukeTop API connection failed')),
-                ontimeout: () => reject(new Error('NukeTop API timed out'))
+                timeout: 15000,
+
+                onload(response) {
+                    if (
+                        response.status < 200 ||
+                        response.status >= 300
+                    ) {
+                        reject(
+                            new Error(
+                                'NukeTop API returned HTTP ' +
+                                response.status
+                            )
+                        );
+                        return;
+                    }
+
+                    try {
+                        const folders = JSON.parse(response.responseText);
+
+                        if (!Array.isArray(folders)) {
+                            reject(
+                                new Error(
+                                    'Unexpected folder configuration response.'
+                                )
+                            );
+                            return;
+                        }
+
+                        resolve(folders);
+                    } catch (error) {
+                        reject(error);
+                    }
+                },
+
+                onerror() {
+                    reject(
+                        new Error(
+                            'Could not connect to NukeTop Syncthing API.'
+                        )
+                    );
+                },
+
+                ontimeout() {
+                    reject(
+                        new Error(
+                            'NukeTop Syncthing API request timed out.'
+                        )
+                    );
+                }
             });
         });
     }
 
-    async function scan() {
-        if (busy) return;
-        busy = true;
+    async function refreshOriginPaths() {
         try {
-            for (const card of cards()) {
-                const id = folderId(card);
-                if (!id) continue;
-                if (localPaths[id]) { render(card); continue; }
+            const folders = await fetchOriginFolders();
 
-                const wasOpen = expanded(card);
-                if (!wasOpen) {
-                    if (!toggle(card)) continue;
-                    await new Promise(r => setTimeout(r, 300));
+            let changed = false;
+
+            for (const folder of folders) {
+                if (!folder.id || !folder.path) {
+                    continue;
                 }
 
-                const path = await waitPath(card);
-                if (path) {
-                    localPaths[id] = path;
-                    saveCache(LOCAL_KEY, localPaths);
-                    render(card);
-                }
-
-                if (!wasOpen && expanded(card)) {
-                    toggle(card);
-                    await new Promise(r => setTimeout(r, 250));
+                if (originPaths[folder.id] !== folder.path) {
+                    originPaths[folder.id] = folder.path;
+                    changed = true;
                 }
             }
-        } finally {
-            busy = false;
+
+            if (changed) {
+                saveOriginPaths();
+            }
+
+            processFolders();
+
+            console.info(
+                '[Syncthing Paths] Origin paths refreshed from ' +
+                ORIGIN_NAME + '.'
+            );
+        } catch (error) {
+            console.warn(
+                '[Syncthing Paths] Origin lookup failed:',
+                error.message
+            );
+
+            // Previously cached origin paths remain displayed.
+            processFolders();
         }
     }
 
-    function schedule() {
-        if (scheduled) return;
-        scheduled = true;
-        setTimeout(() => {
-            scheduled = false;
-            layout();
-            renderAll();
-            scan();
-        }, DELAY);
+    // ----------------------------------------
+    // Expand / collapse helpers
+    // ----------------------------------------
+
+    function getFolderControls(panel) {
+        const collapse = panel.querySelector('.panel-collapse');
+        const heading = panel.querySelector('.panel-heading');
+
+        if (!collapse || !heading) {
+            return null;
+        }
+
+        const trigger = heading.querySelector(
+            '[data-toggle="collapse"], ' +
+            '[data-bs-toggle="collapse"], ' +
+            'a, button, [role="button"]'
+        ) || heading;
+
+        return {
+            collapse,
+            trigger
+        };
     }
 
-    async function init() {
-        styles();
-        layout();
-        renderAll();
+    function isFolderExpanded(controls) {
+        if (!controls) {
+            return false;
+        }
+
+        const ariaExpanded = controls.trigger.getAttribute(
+            'aria-expanded'
+        );
+
+        if (ariaExpanded === 'true') {
+            return true;
+        }
+
+        if (ariaExpanded === 'false') {
+            return false;
+        }
+
+        return (
+            controls.collapse.classList.contains('in') ||
+            controls.collapse.classList.contains('show')
+        );
+    }
+
+    function clickFolder(controls) {
+        if (controls) {
+            controls.trigger.click();
+        }
+    }
+
+    function wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function waitForFolderPath(
+        panel,
+        folderId,
+        timeout = 12000
+    ) {
+        const start = Date.now();
+
+        while (Date.now() - start < timeout) {
+            const path = getFolderPath(panel);
+
+            if (path) {
+                storeLocalPath(folderId, path);
+                showPaths(panel, folderId);
+                return true;
+            }
+
+            await wait(250);
+        }
+
+        return false;
+    }
+
+    // ----------------------------------------
+    // Automatic capture of uncached folders
+    // ----------------------------------------
+
+    async function autoCaptureFolders() {
+        if (scanRunning || scanStarted) {
+            return;
+        }
+
+        scanRunning = true;
+        scanStarted = true;
 
         try {
-            originPaths = await fetchOrigin();
-            saveCache(ORIGIN_KEY, originPaths);
-        } catch (e) {
-            console.warn('[Folder Paths] Origin lookup failed:', e);
+            const panels = Array.from(getFolderPanels());
+
+            for (const panel of panels) {
+                const folderId = getFolderId(panel);
+
+                if (!folderId) {
+                    continue;
+                }
+
+                // Cached folders are not expanded.
+                if (savedPaths[folderId]) {
+                    showPaths(panel, folderId);
+                    continue;
+                }
+
+                const existingPath = getFolderPath(panel);
+
+                if (existingPath) {
+                    storeLocalPath(folderId, existingPath);
+                    showPaths(panel, folderId);
+                    continue;
+                }
+
+                const controls = getFolderControls(panel);
+
+                if (!controls) {
+                    continue;
+                }
+
+                const wasAlreadyExpanded =
+                    isFolderExpanded(controls);
+
+                if (!wasAlreadyExpanded) {
+                    clickFolder(controls);
+                    await wait(400);
+                }
+
+                await waitForFolderPath(panel, folderId);
+
+                // Only collapse folders opened by this script.
+                if (
+                    !wasAlreadyExpanded &&
+                    isFolderExpanded(controls)
+                ) {
+                    clickFolder(controls);
+                    await wait(400);
+                }
+
+                await wait(250);
+            }
+        } finally {
+            scanRunning = false;
+        }
+    }
+
+    // ----------------------------------------
+    // Dashboard layout
+    // ----------------------------------------
+
+    function arrangeDashboard() {
+        const devices = document.querySelector(
+            '[aria-label="Devices"]'
+        );
+
+        const folders = document.querySelector(
+            '[aria-label="Folders"]'
+        );
+
+        if (!devices || !folders) {
+            return;
         }
 
-        renderAll();
-        schedule();
+        let common = devices.parentElement;
 
-        new MutationObserver(schedule).observe(document.body, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class', 'aria-expanded']
-        });
+        while (common && !common.contains(folders)) {
+            common = common.parentElement;
+        }
+
+        if (!common) {
+            return;
+        }
+
+        let devicesBranch = devices;
+
+        while (
+            devicesBranch.parentElement &&
+            devicesBranch.parentElement !== common
+        ) {
+            devicesBranch = devicesBranch.parentElement;
+        }
+
+        let foldersBranch = folders;
+
+        while (
+            foldersBranch.parentElement &&
+            foldersBranch.parentElement !== common
+        ) {
+            foldersBranch = foldersBranch.parentElement;
+        }
+
+        if (devicesBranch === foldersBranch) {
+            return;
+        }
+
+        common.style.display = 'flex';
+        common.style.flexDirection = 'column';
+        common.style.alignItems = 'stretch';
+
+        devicesBranch.style.order = '0';
+        devicesBranch.style.width = '100%';
+        devicesBranch.style.maxWidth = '100%';
+        devicesBranch.style.flex = '0 0 100%';
+
+        foldersBranch.style.order = '1';
+        foldersBranch.style.width = '100%';
+        foldersBranch.style.maxWidth = '100%';
+        foldersBranch.style.flex = '0 0 100%';
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init, { once: true });
-    } else {
-        init();
+    // ----------------------------------------
+    // Mutation observer
+    // ----------------------------------------
+
+    function scheduleUpdate() {
+        if (updateScheduled) {
+            return;
+        }
+
+        updateScheduled = true;
+
+        setTimeout(() => {
+            updateScheduled = false;
+            processFolders();
+            arrangeDashboard();
+        }, 150);
     }
+
+    const observer = new MutationObserver(scheduleUpdate);
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+    // ----------------------------------------
+    // Manual folder clicks
+    // ----------------------------------------
+
+    document.addEventListener(
+        'click',
+        () => {
+            setTimeout(processFolders, 300);
+            setTimeout(processFolders, 900);
+            setTimeout(processFolders, 1600);
+        },
+        true
+    );
+
+    // ----------------------------------------
+    // Startup
+    // ----------------------------------------
+
+    processFolders();
+    arrangeDashboard();
+
+    setTimeout(() => {
+        refreshOriginPaths();
+        autoCaptureFolders();
+    }, 2000);
+
+    console.info('[Syncthing Folder Paths] Userscript loaded.');
 })();
