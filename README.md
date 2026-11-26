@@ -1,0 +1,2 @@
+# syncthing-show-folder-paths
+ 
